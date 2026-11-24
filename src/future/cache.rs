@@ -2762,6 +2762,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invalidate_entries_if_tenant_prefix_across_batches(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        const NUM_KEYS_PER_TENANT: usize = 1_000;
+
+        let cache = Cache::builder()
+            .max_capacity(10_000)
+            .support_invalidation_closures()
+            .build();
+
+        for i in 0..NUM_KEYS_PER_TENANT {
+            cache.insert(format!("tenant-a:{i}"), i).await;
+            cache.insert(format!("tenant-b:{i}"), i).await;
+        }
+        cache.run_pending_tasks().await;
+
+        cache.invalidate_entries_if(|key, _| key.starts_with("tenant-a:"))?;
+        cache.run_pending_tasks().await;
+
+        for i in 0..NUM_KEYS_PER_TENANT {
+            assert_eq!(cache.get(&format!("tenant-a:{i}")).await, None);
+            assert_eq!(cache.get(&format!("tenant-b:{i}")).await, Some(i));
+        }
+        assert_eq!(cache.entry_count(), NUM_KEYS_PER_TENANT as u64);
+        assert_eq!(cache.invalidation_predicate_count(), 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn time_to_live() {
         // The following `Vec`s will hold actual and expected notifications.
         let actual = Arc::new(Mutex::new(Vec::new()));

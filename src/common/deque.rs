@@ -279,6 +279,10 @@ impl<T> Deque<T> {
     pub(crate) fn reset_cursor(&mut self) {
         self.cursor = None;
     }
+
+    pub(crate) fn cursor_has_next(&self) -> bool {
+        matches!(self.cursor, Some(DeqCursor::Node(_)))
+    }
 }
 
 impl<'a, T> Iterator for &'a mut Deque<T> {
@@ -618,10 +622,15 @@ mod tests {
 
         // -------------------------------------------------------
         // First iteration.
+        assert!(!deque.cursor_has_next());
         assert_eq!((&mut deque).next(), Some(&"a".into()));
+        assert!(deque.cursor_has_next());
         assert_eq!((&mut deque).next(), Some(&"b".into()));
+        assert!(deque.cursor_has_next());
         assert_eq!((&mut deque).next(), Some(&"c".into()));
+        assert!(!deque.cursor_has_next());
         assert!((&mut deque).next().is_none());
+        assert!(!deque.cursor_has_next());
 
         // -------------------------------------------------------
         // Ensure the iterator restarts.
