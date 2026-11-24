@@ -46,6 +46,17 @@
       pointer types. However, raising the minimum version prevents downstream
       lockfiles from resolving to an affected `crossbeam-epoch` version via
       Moka.
+    - Throttled the refresh of an entry's `last_accessed` timestamp on cache
+      reads. Previously every read performed an atomic store of the access time,
+      so a single hot key read tens of thousands of times per second generated
+      tens of thousands of contended stores (and cache-line bounces) per second.
+      Reads now update the access time at most once per 100 microsecond window,
+      collapsing the store rate for a hot key to about 10k stores per second
+      regardless of the read rate. The timestamp keeps its full nanosecond
+      precision (it is not rounded to seconds or minutes); only the update rate
+      is limited, with the worst-case effect on time-to-idle expiration bounded
+      to the same 100 microsecond window. Affects both `sync::Cache` and
+      `future::Cache`.
 
 ## Version 0.12.15
 

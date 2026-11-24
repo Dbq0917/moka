@@ -1,5 +1,6 @@
 use std::sync::atomic::{self, AtomicBool, AtomicU16, AtomicU32, Ordering};
 
+use super::constants::ACCESS_TIME_REFRESH_INTERVAL_NANOS;
 use super::{AccessTime, KeyHash};
 use crate::common::time::{AtomicInstant, Instant};
 use portable_atomic::AtomicU64;
@@ -302,6 +303,47 @@ impl<K> EntryInfo<K> {
             }
         }
     }
+
+    /// Refreshes the `last_accessed` timestamp for a cache read, but only when
+    /// the stored timestamp is older than the refresh interval.
+    ///
+    /// A hot key can be read many thousands of times per second. Updating
+    /// `last_accessed` on every read would issue an atomic store (and bounce the
+    /// cache line between cores) for each of those reads, even though almost all
+    /// of them write a value within microseconds of each other. This method
+    /// collapses those writes: reads that land within
+    /// [`ACCESS_TIME_REFRESH_INTERVAL_NANOS`] of the currently recorded access
+    /// time skip the store entirely, so an entry gets at most one timestamp
+    /// store per interval no matter how hot it is.
+    ///
+    /// The timestamp keeps its full nanosecond precision (it is never rounded
+    /// down to seconds or minutes); only the *rate* at which it advances is
+    /// limited. The bound this introduces is at most one refresh interval, which
+    /// is far below any practical time-to-idle duration.
+    ///
+    /// The update is lock-free: a compare-and-swap makes sure concurrent readers
+    /// cannot move the timestamp backwards and that only one of them actually
+    /// performs the store per interval.
+    #[inline]
+    pub(crate) fn refresh_last_accessed(&self, now: Instant) {
+        let now_nanos = now.as_nanos();
+        let current = self.last_accessed.as_nanos();
+
+        // `u64::MAX` means unset; always record the first access. Otherwise skip
+        // the store while the recorded time is still inside the refresh window.
+        let stale = current == u64::MAX
+            || now_nanos.saturating_sub(current) >= ACCESS_TIME_REFRESH_INTERVAL_NANOS;
+        if !stale {
+            return;
+        }
+
+        // On CAS failure another thread refreshed the timestamp first; their
+        // value is at least as recent as the one we observed, so there is
+        // nothing more to do.
+        let _ = self
+            .last_accessed
+            .compare_exchange_nanos(current, now_nanos);
+    }
 }
 
 #[cfg(feature = "unstable-debug-counters")]
@@ -336,6 +378,7 @@ impl<K> AccessTime for EntryInfo<K> {
 #[cfg(test)]
 mod tests {
     use super::{EntryInfo, KeyHash};
+    use crate::common::concurrent::AccessTime;
     use crate::common::time::Instant;
     use std::sync::Arc;
 
@@ -367,5 +410,71 @@ mod tests {
         info.retire();
         // Second retire violates the exclusive-call invariant; debug-asserted.
         info.retire();
+    }
+
+    #[test]
+    fn refresh_last_accessed_throttles_within_window() {
+        use super::super::constants::ACCESS_TIME_REFRESH_INTERVAL_NANOS;
+
+        let info = make_entry_info();
+        let start = Instant::from_nanos(1_000_000);
+        info.set_last_accessed(start);
+
+        // A read well inside the refresh window must not move the timestamp.
+        let inside = Instant::from_nanos(start.as_nanos() + ACCESS_TIME_REFRESH_INTERVAL_NANOS / 2);
+        info.refresh_last_accessed(inside);
+        assert_eq!(info.last_accessed(), Some(start));
+
+        // Reads right up to (but not reaching) the window boundary are ignored.
+        let just_under =
+            Instant::from_nanos(start.as_nanos() + ACCESS_TIME_REFRESH_INTERVAL_NANOS - 1);
+        info.refresh_last_accessed(just_under);
+        assert_eq!(info.last_accessed(), Some(start));
+
+        // Once the window elapses, the timestamp is refreshed with full
+        // nanosecond precision (no rounding to seconds or minutes).
+        let after =
+            Instant::from_nanos(start.as_nanos() + ACCESS_TIME_REFRESH_INTERVAL_NANOS + 123);
+        info.refresh_last_accessed(after);
+        assert_eq!(info.last_accessed(), Some(after));
+    }
+
+    #[test]
+    fn refresh_last_accessed_never_moves_backwards_under_contention() {
+        use std::thread;
+
+        use super::super::constants::ACCESS_TIME_REFRESH_INTERVAL_NANOS;
+
+        let info = Arc::new(make_entry_info());
+        // Seed an access time so the "unset" fast path does not apply.
+        info.set_last_accessed(Instant::from_nanos(0));
+
+        let mut handles = Vec::new();
+        let thread_count = 8u64;
+        for thread_idx in 0..thread_count {
+            let info = Arc::clone(&info);
+            handles.push(thread::spawn(move || {
+                for step in 0..1_000u64 {
+                    // Every thread offers globally increasing timestamps spaced
+                    // further apart than the refresh window, so each call is
+                    // eligible to store. The CAS must never move the value
+                    // backwards regardless of how the threads interleave.
+                    let nanos = step * ACCESS_TIME_REFRESH_INTERVAL_NANOS * 8 + thread_idx;
+                    info.refresh_last_accessed(Instant::from_nanos(nanos));
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        // Final value is one of the timestamps actually offered: it must be at
+        // least the seed and no larger than the biggest timestamp any thread
+        // produced, proving the timestamp stayed within range and never rolled
+        // back.
+        let largest_offered = 999 * ACCESS_TIME_REFRESH_INTERVAL_NANOS * 8 + thread_count - 1;
+        let final_nanos = info.last_accessed().unwrap().as_nanos();
+        assert!(final_nanos <= largest_offered);
+        assert!(final_nanos >= ACCESS_TIME_REFRESH_INTERVAL_NANOS);
     }
 }

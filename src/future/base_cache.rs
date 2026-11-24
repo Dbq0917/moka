@@ -329,7 +329,7 @@ where
                         );
                     }
 
-                    entry.set_last_accessed(now);
+                    entry.entry_info().refresh_last_accessed(now);
 
                     let maybe_key = if need_key { Some(Arc::clone(k)) } else { None };
                     let ent = Entry::new(maybe_key, entry.value.clone(), false, false);

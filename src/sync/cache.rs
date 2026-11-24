@@ -1881,7 +1881,7 @@ where
 mod tests {
     use super::Cache;
     use crate::{
-        common::{time::Clock, HousekeeperConfig},
+        common::{concurrent::AccessTime, time::Clock, HousekeeperConfig},
         notification::RemovalCause,
         policy::{test_utils::ExpiryCallCounters, EvictionPolicy},
         Expiry,
@@ -2584,6 +2584,130 @@ mod tests {
         mock.increment(Duration::from_secs(2));
         assert_eq!(cache.get(&1), Some(1));
         cache.run_pending_tasks();
+        assert_eq!(cache.get(&1), Some(1));
+    }
+
+    // Reads on a hot key must refresh the access-time timestamp at most once per
+    // sub-millisecond window, while keeping nanosecond precision and preserving
+    // the time-to-idle expiration semantics.
+    #[test]
+    fn hot_key_reads_throttle_access_time_but_keep_precision() {
+        use crate::common::concurrent::constants::ACCESS_TIME_REFRESH_INTERVAL_NANOS;
+
+        let (clock, mock) = Clock::mock();
+        let mut cache = Cache::builder()
+            .max_capacity(10)
+            // A short, sub-second TTI so the test can prove precision was not
+            // degraded to second/minute granularity.
+            .time_to_idle(Duration::from_nanos(
+                ACCESS_TIME_REFRESH_INTERVAL_NANOS * 50,
+            ))
+            .clock(clock)
+            .build();
+        cache.reconfigure_for_testing();
+
+        // Make the cache exterior immutable.
+        let cache = cache;
+
+        cache.insert(1, 1);
+
+        let recorded = || {
+            let hash = cache.base.hash(&1);
+            cache
+                .base
+                .inner
+                .cache
+                .get_key_value_and_then(
+                    hash,
+                    |k: &Arc<i32>| **k == 1,
+                    |_k, entry| entry.entry_info().last_accessed(),
+                )
+                .expect("entry present")
+        };
+
+        let window = Duration::from_nanos(ACCESS_TIME_REFRESH_INTERVAL_NANOS);
+
+        // A flood of reads inside a single refresh window must not move the
+        // timestamp past the first read in that window.
+        let before_window = recorded();
+        mock.increment(window / 2);
+        for _ in 0..10_000 {
+            assert_eq!(cache.get(&1), Some(1));
+        }
+        let after_flood = recorded();
+        assert!(
+            after_flood.saturating_duration_since(before_window) < window,
+            "timestamp must be throttled within one window, advanced by {:?}",
+            after_flood.saturating_duration_since(before_window)
+        );
+
+        // After the window elapses, the next read advances the timestamp with full
+        // nanosecond precision (i.e. it is not quantized to seconds or minutes).
+        mock.increment(window + Duration::from_nanos(123));
+        assert_eq!(cache.get(&1), Some(1));
+        let advanced = recorded();
+        assert!(advanced > after_flood);
+        // The 123ns remainder survives, proving sub-microsecond (not minute)
+        // granularity.
+        let delta = advanced.saturating_duration_since(after_flood).as_nanos();
+        assert_eq!(delta % 1_000, 123, "expected 123ns remainder, got {delta}");
+
+        // Continuously reading keeps the hot entry alive well past its nominal TTI
+        // as long as reads happen more often than the TTI.
+        for _ in 0..100 {
+            mock.increment(window);
+            assert_eq!(cache.get(&1), Some(1));
+        }
+
+        // Once reads stop for longer than the TTI, the entry still expires.
+        mock.increment(Duration::from_nanos(
+            ACCESS_TIME_REFRESH_INTERVAL_NANOS * 60,
+        ));
+        cache.run_pending_tasks();
+        assert_eq!(cache.get(&1), None);
+    }
+
+    // Many threads hammering a single hot key must keep the entry alive and never
+    // observe a backwards-jumping or corrupt access timestamp, even though the
+    // timestamp store is throttled to one per window.
+    #[test]
+    fn hot_key_concurrent_reads_keep_entry_alive() {
+        use std::thread;
+
+        let cache = Cache::builder()
+            .max_capacity(10)
+            .time_to_idle(Duration::from_secs(60))
+            .build();
+        cache.insert(1, 1);
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let cache = cache.clone();
+            handles.push(thread::spawn(move || {
+                let mut last_seen = Option::<crate::common::time::Instant>::None;
+                for _ in 0..50_000 {
+                    assert_eq!(cache.get(&1), Some(1));
+                    let now = cache
+                        .base
+                        .inner
+                        .cache
+                        .get_key_value_and_then(
+                            cache.base.hash(&1),
+                            |k: &Arc<i32>| **k == 1,
+                            |_k, entry| entry.entry_info().last_accessed(),
+                        )
+                        .expect("hot entry must never disappear");
+                    if let Some(prev) = last_seen {
+                        assert!(now >= prev, "access timestamp moved backwards");
+                    }
+                    last_seen = Some(now);
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
         assert_eq!(cache.get(&1), Some(1));
     }
 

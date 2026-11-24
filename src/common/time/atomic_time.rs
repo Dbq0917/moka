@@ -47,11 +47,30 @@ impl AtomicInstant {
         }
     }
 
+    /// Returns the raw nanosecond value, or `u64::MAX` if the `Instant` is unset.
+    #[inline]
+    pub(crate) fn as_nanos(&self) -> u64 {
+        self.instant.load(Ordering::Acquire)
+    }
+
     /// Sets the `Instant`.
     pub(crate) fn set_instant(&self, instant: Instant) {
         // Ensure the `Instant` is not `u64::MAX`, which means unset.
         debug_assert!(instant.as_nanos() != u64::MAX);
 
         self.instant.store(instant.as_nanos(), Ordering::Release);
+    }
+
+    /// Stores `nanos` if its current value equals `current`.
+    ///
+    /// Returns `Ok(())` on success, or `Err(actual)` with the value observed at
+    /// the failed comparison. This is a thin wrapper around
+    /// [`AtomicU64::compare_exchange`], used to refresh a timestamp only when no
+    /// other thread has done so in the meantime.
+    #[inline]
+    pub(crate) fn compare_exchange_nanos(&self, current: u64, nanos: u64) -> Result<(), u64> {
+        self.instant
+            .compare_exchange(current, nanos, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| ())
     }
 }

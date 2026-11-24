@@ -354,7 +354,7 @@ where
                 );
             }
 
-            entry.set_last_accessed(now);
+            entry.entry_info().refresh_last_accessed(now);
 
             let v = entry.value.clone();
             let op = ReadOp::Hit {
