@@ -143,6 +143,7 @@ where
         Cache::with_everything(
             self.name,
             self.max_capacity,
+            self.max_capacity,
             self.initial_capacity,
             build_hasher,
             self.weigher,
@@ -231,6 +232,7 @@ where
         builder_utils::ensure_expirations_or_panic(exp.time_to_live(), exp.time_to_idle());
         Cache::with_everything(
             self.name,
+            self.max_capacity,
             self.max_capacity,
             self.initial_capacity,
             hasher,

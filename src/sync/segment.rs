@@ -1,4 +1,5 @@
 use equivalent::Equivalent;
+use parking_lot::Mutex;
 
 use super::{cache::Cache, CacheBuilder, OwnedKeyEntrySelector, RefKeyEntrySelector};
 use crate::common::concurrent::Weigher;
@@ -17,7 +18,7 @@ use std::{
     collections::hash_map::RandomState,
     fmt,
     hash::{BuildHasher, Hash},
-    sync::Arc,
+    sync::{Arc, Weak},
 };
 
 /// A thread-safe concurrent in-memory cache, with multiple internal segments.
@@ -25,6 +26,11 @@ use std::{
 /// `SegmentedCache` has multiple internal [`Cache`][cache-struct] instances for
 /// increased concurrent update performance. However, it has little overheads on
 /// retrievals and updates for managing these segments.
+///
+/// The configured capacity is shared by all segments. When the cache is full,
+/// eviction compares each segment's least-recently-used candidate and removes the
+/// coldest entry across all segments. This avoids evicting hot entries just because
+/// their segment happened to fill first.
 ///
 /// For usage examples, see the document of the [`Cache`][cache-struct].
 ///
@@ -627,6 +633,9 @@ where
         for segment in self.inner.segments.iter() {
             segment.run_pending_tasks();
         }
+        if let Some(global_eviction) = &self.inner.global_eviction {
+            global_eviction();
+        }
     }
 }
 
@@ -690,6 +699,7 @@ struct Inner<K, V, S> {
     segments: Box<[Cache<K, V, S>]>,
     build_hasher: S,
     segment_shift: u32,
+    global_eviction: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl<K, V, S> Inner<K, V, S>
@@ -720,7 +730,7 @@ where
 
         let actual_num_segments = num_segments.next_power_of_two();
         let segment_shift = 64 - actual_num_segments.trailing_zeros();
-        let seg_max_capacity =
+        let seg_frequency_sketch_capacity =
             max_capacity.map(|n| (n as f64 / actual_num_segments as f64).ceil() as u64);
         let seg_init_capacity =
             initial_capacity.map(|cap| (cap as f64 / actual_num_segments as f64).ceil() as usize);
@@ -730,7 +740,8 @@ where
             .map(|_| {
                 Cache::with_everything(
                     name.clone(),
-                    seg_max_capacity,
+                    max_capacity,
+                    seg_frequency_sketch_capacity,
                     seg_init_capacity,
                     build_hasher.clone(),
                     weigher.clone(),
@@ -742,13 +753,34 @@ where
                     clock.clone(),
                 )
             })
-            .collect::<Vec<_>>();
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+
+        let global_eviction = max_capacity.map(|_| {
+            let coordinator = Arc::new(GlobalEviction::<K, V, S> {
+                max_capacity,
+                segments: segments.to_vec().into_boxed_slice(),
+                run_lock: Mutex::new(()),
+            });
+            let callback: Arc<dyn Fn() + Send + Sync> = {
+                let coordinator = Arc::clone(&coordinator);
+                Arc::new(move || coordinator.evict_if_needed())
+            };
+
+            for segment in segments.iter() {
+                let weak_callback: Weak<dyn Fn() + Send + Sync> = Arc::downgrade(&callback);
+                segment.set_global_eviction_callback(weak_callback);
+            }
+
+            callback
+        });
 
         Self {
             desired_capacity: max_capacity,
-            segments: segments.into_boxed_slice(),
+            segments,
             build_hasher,
             segment_shift,
+            global_eviction,
         }
     }
 
@@ -772,6 +804,93 @@ where
             0
         } else {
             (hash >> self.segment_shift) as usize
+        }
+    }
+}
+
+struct GlobalEviction<K, V, S> {
+    max_capacity: Option<u64>,
+    segments: Box<[Cache<K, V, S>]>,
+    run_lock: Mutex<()>,
+}
+
+thread_local! {
+    static GLOBAL_EVICTION_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+struct GlobalEvictionGuard;
+
+impl Drop for GlobalEvictionGuard {
+    fn drop(&mut self) {
+        GLOBAL_EVICTION_ACTIVE.with(|active| active.set(false));
+    }
+}
+
+impl<K, V, S> GlobalEviction<K, V, S>
+where
+    K: Hash + Eq + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    S: BuildHasher + Clone + Send + Sync + 'static,
+{
+    fn evict_if_needed(&self) {
+        // Eviction listeners run inline. A listener may insert into another
+        // segment, whose maintenance can call back into this coordinator.
+        if GLOBAL_EVICTION_ACTIVE.with(|active| active.replace(true)) {
+            return;
+        }
+        let _guard = GlobalEvictionGuard;
+
+        let Some(max_capacity) = self.max_capacity else {
+            return;
+        };
+        if max_capacity == 0 {
+            return;
+        }
+
+        let total_weight = self.segments.iter().fold(0u64, |total, segment| {
+            total.saturating_add(segment.weighted_size())
+        });
+        if total_weight <= max_capacity {
+            return;
+        }
+
+        let _run_lock = self.run_lock.lock();
+        let mut excluded = vec![false; self.segments.len()];
+
+        loop {
+            let total_weight = self.segments.iter().fold(0u64, |total, segment| {
+                total.saturating_add(segment.weighted_size())
+            });
+            if total_weight <= max_capacity {
+                break;
+            }
+
+            // Each segment exposes only its LRU front. Comparing those fronts is
+            // sufficient to find the global LRU candidate without scanning the
+            // cache, because each segment's queue is ordered by recency.
+            let candidate = self
+                .segments
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| !excluded[*index])
+                .filter_map(|(index, segment)| {
+                    segment
+                        .lru_candidate()
+                        .map(|(last_accessed, frequency)| (index, last_accessed, frequency))
+                })
+                .min_by_key(|&(_, last_accessed, frequency)| (frequency, last_accessed));
+
+            let Some((index, last_accessed, _)) = candidate else {
+                break;
+            };
+
+            if self.segments[index].evict_lru_entry(last_accessed) {
+                excluded.fill(false);
+            } else {
+                // The candidate changed concurrently or is not evictable yet.
+                // Try the next-coldest segment instead of giving up immediately.
+                excluded[index] = true;
+            }
         }
     }
 }
@@ -1062,6 +1181,95 @@ mod tests {
         assert!(cache.get(&20).is_some());
         assert!(!cache.contains_key(&10));
         assert!(cache.contains_key(&20));
+    }
+
+    #[test]
+    fn global_eviction_keeps_hot_keys_in_a_skewed_segment() {
+        use crate::common::time::Clock;
+        use std::hash::{BuildHasher, Hasher};
+
+        #[derive(Clone)]
+        struct SegmentHasher;
+
+        struct SegmentHasherState(u64);
+
+        impl BuildHasher for SegmentHasher {
+            type Hasher = SegmentHasherState;
+
+            fn build_hasher(&self) -> Self::Hasher {
+                SegmentHasherState(0)
+            }
+        }
+
+        impl Hasher for SegmentHasherState {
+            fn finish(&self) -> u64 {
+                self.0
+            }
+
+            fn write(&mut self, bytes: &[u8]) {
+                for byte in bytes {
+                    self.0 = self.0.rotate_left(8) ^ u64::from(*byte);
+                }
+            }
+
+            fn write_u64(&mut self, value: u64) {
+                // The top two bits select the cache segment. The remaining bits
+                // keep keys unique within that segment.
+                let segment = value & 0b11;
+                let id = value >> 2;
+                self.0 = (segment << 62) | id;
+            }
+        }
+
+        const SEGMENTS: usize = 4;
+        const CAPACITY: u64 = 24;
+        const HOT_KEYS: u64 = 12;
+
+        let (clock, mock) = Clock::mock();
+        let cache = SegmentedCache::builder(SEGMENTS)
+            .max_capacity(CAPACITY)
+            .clock(clock)
+            .build_with_hasher(SegmentHasher);
+
+        // Put all hot keys into segment 0. This segment alone exceeds the old
+        // per-segment quota (24 / 4 = 6) but not the global capacity.
+        for id in 0..HOT_KEYS {
+            cache.insert(id << 2, id);
+        }
+        cache.run_pending_tasks();
+
+        // Make every hot key frequent.
+        mock.increment(Duration::from_millis(10));
+        for _ in 0..5 {
+            for id in 0..HOT_KEYS {
+                assert_eq!(cache.get(&(id << 2)), Some(id));
+            }
+        }
+        cache.run_pending_tasks();
+
+        // Fill the other segments with cold keys.
+        mock.increment(Duration::from_millis(10));
+        for id in 0..HOT_KEYS {
+            let segment = 1 + id % (SEGMENTS as u64 - 1);
+            cache.insert((id << 2) | segment, 100 + id);
+        }
+        cache.run_pending_tasks();
+        assert_eq!(cache.entry_count(), CAPACITY);
+
+        // Exceed the global capacity. The global victim selection should remove
+        // cold keys instead of the frequent hot keys in segment 0, even though
+        // the cold keys are more recent.
+        mock.increment(Duration::from_millis(10));
+        for id in HOT_KEYS..(HOT_KEYS + 6) {
+            let segment = 1 + id % (SEGMENTS as u64 - 1);
+            cache.insert((id << 2) | segment, 100 + id);
+        }
+        cache.run_pending_tasks();
+
+        assert_eq!(cache.entry_count(), CAPACITY);
+        for id in 0..HOT_KEYS {
+            assert_eq!(cache.get(&(id << 2)), Some(id), "hot key {id} was evicted");
+        }
     }
 
     #[test]

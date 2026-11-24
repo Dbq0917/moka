@@ -25,7 +25,7 @@ use std::{
     collections::hash_map::RandomState,
     fmt,
     hash::{BuildHasher, Hash},
-    sync::Arc,
+    sync::{Arc, Weak},
     time::Duration,
 };
 
@@ -700,6 +700,7 @@ where
         Self::with_everything(
             None,
             Some(max_capacity),
+            Some(max_capacity),
             None,
             build_hasher,
             None,
@@ -732,6 +733,7 @@ where
     pub(crate) fn with_everything(
         name: Option<String>,
         max_capacity: Option<u64>,
+        frequency_sketch_capacity: Option<u64>,
         initial_capacity: Option<usize>,
         build_hasher: S,
         weigher: Option<Weigher<K, V>>,
@@ -746,6 +748,7 @@ where
             base: BaseCache::new(
                 name,
                 max_capacity,
+                frequency_sketch_capacity,
                 initial_capacity,
                 build_hasher.clone(),
                 weigher,
@@ -1814,6 +1817,18 @@ where
     V: Clone + Send + Sync + 'static,
     S: BuildHasher + Clone + Send + Sync + 'static,
 {
+    pub(crate) fn set_global_eviction_callback(&self, callback: Weak<dyn Fn() + Send + Sync>) {
+        self.base.set_global_eviction_callback(callback);
+    }
+
+    pub(crate) fn lru_candidate(&self) -> Option<(Instant, u8)> {
+        self.base.inner.lru_candidate()
+    }
+
+    pub(crate) fn evict_lru_entry(&self, expected_last_accessed: Instant) -> bool {
+        self.base.inner.evict_lru_entry(expected_last_accessed)
+    }
+
     // TODO: Like future::Cache, move this method to BaseCache.
     #[inline]
     fn schedule_write_op(

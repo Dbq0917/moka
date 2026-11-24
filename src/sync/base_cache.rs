@@ -42,7 +42,7 @@ use std::{
     rc::Rc,
     sync::{
         atomic::{AtomicBool, AtomicU8, Ordering},
-        Arc,
+        Arc, Weak,
     },
     time::{Duration, Instant as StdInstant},
 };
@@ -104,6 +104,10 @@ impl<K, V, S> BaseCache<K, V, S> {
         self.inner.is_removal_notifier_enabled()
     }
 
+    pub(crate) fn set_global_eviction_callback(&self, callback: Weak<dyn Fn() + Send + Sync>) {
+        self.inner.set_global_eviction_callback(callback);
+    }
+
     #[inline]
     pub(crate) fn current_time(&self) -> Instant {
         self.inner.current_time()
@@ -139,6 +143,7 @@ where
     pub(crate) fn new(
         name: Option<String>,
         max_capacity: Option<u64>,
+        frequency_sketch_capacity: Option<u64>,
         initial_capacity: Option<usize>,
         build_hasher: S,
         weigher: Option<Weigher<K, V>>,
@@ -163,6 +168,7 @@ where
         let inner = Arc::new(Inner::new(
             name,
             max_capacity,
+            frequency_sketch_capacity,
             initial_capacity,
             build_hasher,
             weigher,
@@ -872,6 +878,7 @@ type CacheStore<K, V, S> = crate::cht::SegmentedHashMap<Arc<K>, MiniArc<ValueEnt
 pub(crate) struct Inner<K, V, S> {
     name: Option<String>,
     max_capacity: Option<u64>,
+    frequency_sketch_capacity: Option<u64>,
     entry_count: AtomicCell<u64>,
     weighted_size: AtomicCell<u64>,
     pub(crate) cache: CacheStore<K, V, S>,
@@ -890,6 +897,7 @@ pub(crate) struct Inner<K, V, S> {
     key_locks: Option<KeyLockMap<K, S>>,
     invalidator: Option<Invalidator<K, V, S>>,
     clock: Clock,
+    global_eviction_callback: RwLock<Option<Weak<dyn Fn() + Send + Sync>>>,
 }
 
 impl<K, V, S> Drop for Inner<K, V, S> {
@@ -934,6 +942,10 @@ impl<K, V, S> Inner<K, V, S> {
     #[inline]
     pub(crate) fn is_removal_notifier_enabled(&self) -> bool {
         self.removal_notifier.is_some()
+    }
+
+    pub(crate) fn set_global_eviction_callback(&self, callback: Weak<dyn Fn() + Send + Sync>) {
+        *self.global_eviction_callback.write() = Some(callback);
     }
 
     pub(crate) fn maybe_key_lock(&self, key: &Arc<K>) -> Option<KeyLock<'_, K, S>>
@@ -1006,6 +1018,7 @@ where
     fn new(
         name: Option<String>,
         max_capacity: Option<u64>,
+        frequency_sketch_capacity: Option<u64>,
         initial_capacity: Option<usize>,
         build_hasher: S,
         weigher: Option<Weigher<K, V>>,
@@ -1053,6 +1066,7 @@ where
         Self {
             name,
             max_capacity,
+            frequency_sketch_capacity,
             entry_count: AtomicCell::default(),
             weighted_size: AtomicCell::default(),
             cache,
@@ -1071,6 +1085,7 @@ where
             key_locks,
             invalidator,
             clock,
+            global_eviction_callback: RwLock::default(),
         }
     }
 
@@ -1320,8 +1335,19 @@ where
 
         crossbeam_epoch::pin().flush();
 
-        // Ensure the deqs lock is held until here.
+        // The global eviction callback can inspect this segment's deques, so both
+        // maintenance locks must be released before invoking it.
         drop(deqs);
+        drop(timer_wheel);
+
+        let global_eviction_callback = self
+            .global_eviction_callback
+            .read()
+            .as_ref()
+            .and_then(Weak::upgrade);
+        if let Some(callback) = global_eviction_callback {
+            callback();
+        }
 
         eviction_state.more_entries_to_evict
     }
@@ -1350,7 +1376,7 @@ where
 
     #[inline]
     fn should_enable_frequency_sketch(&self, counters: &EvictionCounters) -> bool {
-        match self.max_capacity {
+        match self.frequency_sketch_capacity {
             None | Some(0) => false,
             Some(max_cap) => {
                 if self.frequency_sketch_enabled.load(Ordering::Acquire) {
@@ -1364,7 +1390,7 @@ where
 
     #[inline]
     fn enable_frequency_sketch(&self, counters: &EvictionCounters) {
-        if let Some(max_cap) = self.max_capacity {
+        if let Some(max_cap) = self.frequency_sketch_capacity {
             let c = counters;
             let cap = if self.weigher.is_none() {
                 max_cap
@@ -1377,7 +1403,7 @@ where
 
     #[cfg(test)]
     fn enable_frequency_sketch_for_testing(&self) {
-        if let Some(max_cap) = self.max_capacity {
+        if let Some(max_cap) = self.frequency_sketch_capacity {
             self.do_enable_frequency_sketch(max_cap);
         }
     }
@@ -2326,6 +2352,67 @@ where
         }
     }
 
+    /// Returns the timestamp and estimated frequency of this segment's LRU
+    /// candidate. This only peeks at the probation queue's front; it does not
+    /// scan the segment.
+    pub(crate) fn lru_candidate(&self) -> Option<(Instant, u8)> {
+        let deqs = self.deques.lock();
+        let node = deqs.probation.peek_front()?;
+        let entry_info = node.element.entry_info();
+
+        if entry_info.is_dirty() || !entry_info.is_alive() {
+            None
+        } else {
+            let last_accessed = entry_info.last_accessed()?;
+            let frequency = self.frequency_sketch.read().frequency(node.element.hash());
+            Some((last_accessed, frequency))
+        }
+    }
+
+    /// Evicts this segment's LRU entry if it is still the candidate identified by
+    /// `expected_last_accessed`.
+    pub(crate) fn evict_lru_entry(&self, expected_last_accessed: Instant) -> bool
+    where
+        V: Clone,
+    {
+        if self.max_capacity == Some(0) {
+            return false;
+        }
+
+        let mut deqs = self.deques.lock();
+        let mut timer_wheel = self.timer_wheel.lock();
+
+        let is_expected_candidate = deqs.probation.peek_front().is_some_and(|node| {
+            let entry_info = node.element.entry_info();
+            !entry_info.is_dirty()
+                && entry_info.is_alive()
+                && entry_info.last_accessed() == Some(expected_last_accessed)
+        });
+        if !is_expected_candidate {
+            return false;
+        }
+
+        let current_ec = self.entry_count.load();
+        let current_ws = self.weighted_size.load();
+        let mut eviction_state =
+            EvictionState::new(current_ec, current_ws, self.removal_notifier.as_ref());
+        let eviction_count_before = eviction_state.counters.eviction_count;
+
+        self.evict_lru_entries(
+            &mut deqs,
+            &mut timer_wheel,
+            1,
+            u64::MAX,
+            &mut eviction_state,
+        );
+
+        self.entry_count.store(eviction_state.counters.entry_count);
+        self.weighted_size
+            .store(eviction_state.counters.weighted_size);
+
+        eviction_state.counters.eviction_count > eviction_count_before
+    }
+
     fn evict_lru_entries(
         &self,
         deqs: &mut Deques<K>,
@@ -2651,6 +2738,7 @@ mod tests {
         let ensure_sketch_len = |max_capacity, len, name| {
             let cache = BaseCache::<u8, u8>::new(
                 None,
+                Some(max_capacity),
                 Some(max_capacity),
                 None,
                 RandomState::default(),
@@ -3024,6 +3112,7 @@ mod tests {
         let (clock, mock) = Clock::mock();
 
         let mut cache = BaseCache::<Key, Value>::new(
+            None,
             None,
             None,
             None,
@@ -3479,6 +3568,7 @@ mod tests {
         fn new_lru_cache() -> BaseCache<u32, u32> {
             let mut cache = BaseCache::<u32, u32>::new(
                 None,
+                Some(MAX),
                 Some(MAX),
                 None,
                 RandomState::default(),
